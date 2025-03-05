@@ -1,7 +1,16 @@
-# **利用vivado对b210mini进行编程**
-## **器件连接**：
+根据原理图中JTAG段13，14脚接地，而GPIO端13，14脚不接地。对应实物可以判断JTAG端以及1-14端口的顺序。通过测量针脚底座的间距，可以获得连接线的购买类型。同时为了搭配Xilinx下载线的8pin针脚顺序，需要购买单头1*14pin间距1.25mm的杜邦连接线。
 
-目前给我的器材有B210mini,Xilinx下载线。先将b210mini通过tpyec接口连接到电脑，保证vivado可以检测到硬件。然后将下载线的JTAG1*8针脚连接到b210mini的JTAG输出线，根据原理图和实物的对应可知。从B210min引出的端口分别是对应原理图的8号口到13号口，14号口接地可悬空。分别是从8号口的TDO到13号口的GND。为了对应下载线端的针脚，将线的另一端按照下载线针脚的顺序排列，分别是从TMS到VREF，其中NC悬空。最后Xilinx下载线的另一端必须连接到笔记本电脑，这样可以控制代码的写入。
-## **程序编写**：
+https://e.tb.cn/h.TE56SHyZk9K8Agg?tk=93YieOcTzC5 MF287 「MX1.25/1.27间距转杜邦1P2P3P4P5-12P主板连接线1拖4传感器电子线」
 
-基于vivado编程，需要先下载vivado，然后创建工程，并且选择b210mini的芯片（查看用户手册应该是采用 XC7A200T/XC7A100T ），然后编写代码，完成synthesis和implement，最后生成bit文件，这也是烧入b210mini的最终文件。然后进入 Vivado Hardware Manager，选择fpga设备后烧入bit文件即可。
+![Image](https://github.com/user-attachments/assets/16ed0542-5b2c-4b9f-b408-bead2846e535)
+
+
+
+![Image](https://github.com/user-attachments/assets/3cb3aa8d-5730-4121-b380-7fc40569cc86)
+
+
+
+![Image](https://github.com/user-attachments/assets/e13c1111-8828-44a7-aa82-7407522aff55)
+
+
+![Image](https://github.com/user-attachments/assets/eefdbc08-b0be-453d-8240-964de90cf272)
