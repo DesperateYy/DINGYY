@@ -1,0 +1,156 @@
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.io import loadmat
+from scipy.linalg import solve
+
+# --- TMA 和 DOA 算法参数 ---
+DEFAULT_DATA_FILENAME = "captured_tma_data_cw_2ghz.mat"  # 【修改】加载 CW 的数据
+
+SWITCHING_FREQ = 10e3  # 10 kHz (您的FPGA实际开关频率)
+NUM_ANTENNA_ELEMENTS = 2
+
+antenna_params = {
+    "d": 0.07,  # 【确认】天线间距设置为 0.07 米
+    "n_values": 5
+}
+switch_params = {"fm": SWITCHING_FREQ, "N": NUM_ANTENNA_ELEMENTS, "ratio": 0.5}
+switch_params["Tm"] = 1 / switch_params["fm"]
+
+c = 3e8
+
+if __name__ == "__main__":
+    data_filename = DEFAULT_DATA_FILENAME
+    print(f"--- Signal Processing, Plotting, and DOA Estimation Script (CW @ 2 GHz) ---")
+    print(f"▶️  Loading real hardware data from {data_filename}...")
+
+    try:
+        mat_data = loadmat(data_filename)
+        x_TMA_noisy = mat_data['tma_signal_raw'].flatten()
+        s_ref_raw = mat_data['ref_signal_raw'].flatten()
+        raw_config_void = mat_data['config'][0, 0]
+        config_loaded = {}
+        for key in raw_config_void.dtype.names:
+            value = raw_config_void[key]
+            if isinstance(value, np.ndarray) and value.size == 1:
+                config_loaded[key] = value.item()
+            else:
+                config_loaded[key] = value
+        print("✅  Data loaded successfully.")
+    except FileNotFoundError:
+        print(f"❌ Error: Data file '{data_filename}' not found. Please run 'acquire_data_cw_2ghz.py' first.")
+        exit()
+    except Exception as e:
+        print(f"❌ Error loading data: {e}")
+        exit()
+
+    # --- 使用加载的配置参数 ---
+    fs = config_loaded['sample_rate']
+    f0 = config_loaded['center_freq']  # 载波中心频率 (从文件中加载的 2 GHz)
+
+    lambda_0 = c / f0
+    lambda_0_half = lambda_0 / 2
+
+    print(f"   Carrier Frequency (f0): {f0 / 1e9:.3f} GHz")
+    print(f"   Sampling Rate (fs): {fs / 1e3:.1f} kHz")
+    print(f"   Switching Frequency (fm): {switch_params['fm'] / 1e3:.1f} kHz")
+    print(f"   Wavelength (lambda_0): {lambda_0:.4f} meters")
+    print(f"   Half-Wavelength (lambda_0/2): {lambda_0_half:.4f} meters")
+    print(f"   Antenna Spacing (d): {antenna_params['d']:.4f} meters (Configured)")
+
+    # --- 1. 核心操作 (不再是脉冲压缩，而是"自混频") ---
+    print("▶️  Performing self-mixing (TMA signal * conj(Reference signal))...")
+    y_processed = x_TMA_noisy * np.conj(s_ref_raw)
+    print("✅  Self-mixing complete.")
+
+    # --- 2. 准备频谱分析参数 ---
+    M = len(x_TMA_noisy);
+    t = np.arange(0, M / fs, 1 / fs);
+    fft_freq = np.fft.fftshift(np.fft.fftfreq(M, d=1 / fs))
+    fft_ref = np.fft.fftshift(np.fft.fft(s_ref_raw))
+    fft_tma = np.fft.fftshift(np.fft.fft(x_TMA_noisy))
+    fft_processed = np.fft.fftshift(np.fft.fft(y_processed))
+
+    # --- 3. 绘制所有关键频谱图 ---
+    print("▶️  Generating spectrum plots...")
+    fig = make_subplots(rows=3, cols=1, subplot_titles=(
+    "Spectrum of Reference Signal (RXB)", "Spectrum of TMA Modulated Signal (RXA)",
+    "Spectrum After Self-Mixing (TMA * conj(Reference))"))
+    # 预期：RXB应该是一个在0Hz处非常尖锐的峰值
+    fig.add_trace(
+        go.Scatter(x=fft_freq / 1e3, y=20 * np.log10(np.abs(fft_ref) + 1e-12), mode='lines', name='Reference Spectrum'),
+        row=1, col=1)
+    fig.update_xaxes(title_text="Frequency Offset (kHz)", range=[-fs / 2 / 1e3, fs / 2 / 1e3], row=1, col=1)
+    fig.update_yaxes(title_text="Power (dB)", row=1, col=1)
+    # 预期：RXA应该是0Hz, ±10kHz, ±30kHz... 处的尖锐峰值
+    fig.add_trace(
+        go.Scatter(x=fft_freq / 1e3, y=20 * np.log10(np.abs(fft_tma) + 1e-12), mode='lines', name='TMA Spectrum'),
+        row=2, col=1)
+    fig.update_xaxes(title_text="Frequency Offset (kHz)", range=[-fs / 2 / 1e3, fs / 2 / 1e3], row=2, col=1)
+    fig.update_yaxes(title_text="Power (dB)", row=2, col=1)
+    # 预期：y_processed应该是0Hz, ±10kHz, ±30kHz... 处的尖锐峰值 (与RXA类似，但相位不同)
+    fig.add_trace(go.Scatter(x=fft_freq / 1e3, y=20 * np.log10(np.abs(fft_processed) + 1e-12), mode='lines',
+                             name='Pulse-Compressed Spectrum'), row=3, col=1)
+    display_range_khz = (switch_params["fm"] * (antenna_params["n_values"] + 1)) / 1e3
+    fig.update_xaxes(title_text="Frequency Offset (kHz)", range=[-display_range_khz, display_range_khz], row=3, col=1)
+    fig.update_yaxes(title_text="Power (dB)", range=[0, 70], row=3, col=1)
+    fig.update_layout(height=1000,
+                      title_text="Signal Analysis: Reference, TMA Modulated, and Self-Mixed Spectra (CW @ 2 GHz)",
+                      showlegend=False)
+    fig.show()
+    print("✅  All spectrum plots generated.")
+
+    # --- 4. DOA 测角算法部分 (与Chirp版本完全相同) ---
+    print("\n--- Starting DOA Estimation ---")
+
+    # a) 提取谐波复数值
+    print("▶️  Extracting harmonic complex values...")
+    Y = np.fft.fft(y_processed) / M;
+    df = fs / M
+    r_list = np.arange(-antenna_params["n_values"], antenna_params["n_values"] + 1);
+    f_list = r_list * switch_params["fm"]
+    bins = np.array([int(np.round(f / df)) % M for f in f_list])
+    bins_unique, unique_idx = np.unique(bins, return_index=True);
+    bins = bins_unique;
+    r_list_filtered = r_list[unique_idx]
+    tildeY = Y[bins]
+
+    # b) 构建开关谐波响应矩阵 (M_matrix)
+    print("▶️  Constructing switch harmonic response matrix (M_matrix)...")
+
+
+    def genSwitch(t_local, Tm, Ton, Toff):
+        tt = np.mod(t_local, Tm);
+        return ((tt >= Ton) & (tt < Toff)).astype(float) if Ton < Toff else ((tt >= Ton) | (tt < Toff)).astype(float)
+
+
+    def genAllSwitch(switch_cfg, t_vec):
+        switchs = np.zeros((switch_cfg["N"], t_vec.size), dtype=float)
+        switchs[0, :] = genSwitch(t_vec, switch_cfg["Tm"], 0, switch_cfg["Tm"] * switch_cfg["ratio"])
+        switchs[1, :] = genSwitch(t_vec, switch_cfg["Tm"], switch_cfg["Tm"] * switch_cfg["ratio"], switch_cfg["Tm"])
+        return np.fft.fft(switchs, axis=1) / M
+
+
+    M_fft = genAllSwitch(switch_params, t);
+    M_matrix = np.zeros((len(bins), switch_params["N"]), dtype=complex)
+    for i, b in enumerate(bins): M_matrix[i, :] = M_fft[:, b]
+    print("✅  M_matrix constructed.")
+
+    # c) 求解DOA
+    print("▶️  Solving for DOA (Direction of Arrival)...")
+    lambda_reg = 1e-6
+    a_hat = solve(M_matrix.conj().T @ M_matrix + lambda_reg * np.eye(switch_params["N"]), M_matrix.conj().T @ tildeY)
+    phase_diff = np.angle(a_hat[1]) - np.angle(a_hat[0])
+    mean_phase_diff = phase_diff
+    sin_theta_hat = np.clip((mean_phase_diff * c) / (2 * np.pi * f0 * antenna_params["d"]), -1, 1)
+    theta_hat_rad = np.arcsin(sin_theta_hat)
+    theta_hat_deg = np.degrees(theta_hat_rad)
+    print("✅  DOA estimation complete.")
+
+    print("\n-------------------------------------")
+    print("--- DOA Estimation Result ---")
+    print(f"Carrier Frequency (f0): {f0 / 1e9:.3f} GHz")
+    print(f"Antenna Spacing (d): {antenna_params['d']:.4f} meters (Configured)")
+    print(f"Estimated Phase Difference: {np.degrees(mean_phase_diff):.3f} degrees")
+    print(f"Estimated Angle (DOA): {theta_hat_deg:.3f} degrees")
+    print("-------------------------------------")
