@@ -1,0 +1,226 @@
+# %%
+from time import sleep
+import uhd
+import numpy as np
+import plotly.graph_objects as go
+
+# %%
+config = {
+    "sample_rate": 2e6,  # 基带采样率
+    "rx_gain": 90,  # 接收增益 (dB)
+    "tx_gain": 90,  # 发送增益 (dB)
+    "chan": [0, 1],  # 双发双收：使用两个通道（会根据设备能力自动裁剪）
+    "center_freq": 1e8,  # 射频中心频率 (Hz)
+    "num_samps": 2000,  # 一次捕获/发送的样本数
+    "chirp_f0": -200e3,  # 起始基带频率 (Hz)
+    "chirp_f1": +200e3,  # 结束基带频率 (Hz)
+    "chirp2_f0": -50e3,  # 第二个通道起始基带频率 (Hz)
+    "chirp2_f1": +50e3,  # 第二个通道结束基带频率 (Hz)
+    "tx_amp": 0.3,  # 发送幅度，< 1 以防削顶
+    "start_delay": 0.15,  # 计划启动延迟 (秒)
+}
+
+
+# %%
+def build_chirp(num_samps, fs, f0, f1, amp, nch):
+    # 线性调频复指数：s[n] = A * exp(j*2π*(f0*n/fs + 0.5*k*(n/fs)^2)), k=(f1-f0)/T
+    n = np.arange(num_samps, dtype=np.float64)
+    T = num_samps / fs
+    k = (f1 - f0) / T
+    t = n / fs
+    phase = 2 * np.pi * (f0 * t + 0.5 * k * t * t)
+    s = (amp * np.exp(1j * phase)).astype(np.complex64)
+    return np.stack([s for _ in range(nch)], axis=0)
+
+
+def full_duplex_txrx(cfg):
+    usrp = uhd.usrp.MultiUSRP("type=b200")
+
+    # 根据设备能力裁剪通道
+    max_rx = usrp.get_rx_num_channels()
+    max_tx = usrp.get_tx_num_channels()
+    chan = [c for c in cfg["chan"] if c < max_rx and c < max_tx]
+    if not chan:
+        chan = [0]
+
+    fs = float(cfg["sample_rate"])
+    fc = float(cfg["center_freq"])
+    num_samps = int(cfg["num_samps"])
+
+    # 配置收发参数
+    for c in chan:
+        usrp.set_rx_rate(fs, c)
+        usrp.set_tx_rate(fs, c)
+        usrp.set_rx_freq(uhd.libpyuhd.types.tune_request(fc), c)
+        usrp.set_tx_freq(uhd.libpyuhd.types.tune_request(fc), c)
+        usrp.set_rx_gain(float(cfg["rx_gain"]), c)
+        usrp.set_tx_gain(float(cfg["tx_gain"]), c)
+
+    # 构造 Streamers
+    rx_args = uhd.usrp.StreamArgs("fc32", "sc16")
+    rx_args.channels = chan
+    tx_args = uhd.usrp.StreamArgs("fc32", "sc16")
+    tx_args.channels = chan
+    rx_md = uhd.types.RXMetadata()
+    tx_md = uhd.types.TXMetadata()
+    rx_stream = usrp.get_rx_stream(rx_args)
+    tx_stream = usrp.get_tx_stream(tx_args)
+
+    # 生成要发送的基带 chirp
+    chirp = build_chirp(
+        num_samps=num_samps,
+        fs=fs,
+        f0=float(cfg["chirp_f0"]),
+        f1=float(cfg["chirp_f1"]),
+        amp=float(cfg["tx_amp"]),
+        nch=len(chan),
+    )
+    # 为第二个通道使用不同的chirp：
+    # 优先使用 config 中的 chirp2_f0/chirp2_f1；若未提供则使用反向扫频（f1->f0）
+    if len(chan) > 1:
+        # alt_f0 = float(cfg.get("chirp2_f0", cfg["chirp_f1"]))
+        # alt_f1 = float(cfg.get("chirp2_f1", cfg["chirp_f0"]))
+        # chirp_ch1 = build_chirp(
+        #     num_samps=num_samps,
+        #     fs=fs,
+        #     f0=alt_f0,
+        #     f1=alt_f1,
+        #     amp=float(cfg["tx_amp"]),
+        #     nch=1,
+        # )[0]
+        # chirp[1, :] = chirp_ch1
+        chirp[1, :] = 0
+
+    # 计划在将来的同一时间同时 开始接收 和 发送
+    t0 = usrp.get_time_now().get_real_secs() + float(cfg["start_delay"])
+
+    # 启动接收（连续模式，定时触发）
+    start_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont)
+    start_cmd.stream_now = False
+    start_cmd.time_spec = uhd.types.TimeSpec(t0)
+    rx_stream.issue_stream_cmd(start_cmd)
+
+    # 分块发送以适配硬件最大包长
+    max_tx = tx_stream.get_max_num_samps()
+    sent = 0
+    first = True
+    while sent < num_samps:
+        to_send = min(max_tx, num_samps - sent)
+        chunk = chirp[:, sent : sent + to_send]
+
+        tx_md.start_of_burst = first
+        tx_md.end_of_burst = (sent + to_send) >= num_samps
+        tx_md.has_time_spec = first  # 仅第一包带时间戳
+        if first:
+            tx_md.time_spec = uhd.types.TimeSpec(t0)
+        ns = tx_stream.send(chunk, tx_md)
+        if ns != to_send:
+            # 发送速率受限时允许轻微差异，此处严格推进计数
+            to_send = ns
+        sent += to_send
+        first = False
+
+    # 接收指定数量的样本
+    rx_buf = np.zeros((len(chan), num_samps), dtype=np.complex64)
+    tmp = np.zeros((len(chan), rx_stream.get_max_num_samps()), dtype=np.complex64)
+    got = 0
+    while got < num_samps:
+        ns = rx_stream.recv(tmp, rx_md, 1.0)
+        if rx_md.error_code != uhd.types.RXMetadataErrorCode.none:
+            print(f"RX error: {rx_md.strerror()}")
+        if ns:
+            ncopy = min(ns, num_samps - got)
+            rx_buf[:, got : got + ncopy] = tmp[:, :ncopy]
+            got += ncopy
+
+    # 停止接收
+    stop_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
+    rx_stream.issue_stream_cmd(stop_cmd)
+
+    return chan, chirp, rx_buf
+
+
+def verify_chirp(ref, rx, fs):
+    # 1) FFT 相关估计延时  2) 对齐  3) 归一化相关  4) 去chirp拟合相位斜率估CFO
+    def est_delay_fft(r, s):
+        # 若参考信号全零，跳过延时估计
+        if np.max(np.abs(s)) < 1e-12:
+            return 0
+        N = len(s)
+        Np = 1 << (2 * N - 1).bit_length()  # >= 2N-1 的2次幂
+        R = np.fft.fft(r, Np)
+        S = np.fft.fft(s, Np)
+        c = np.fft.ifft(R * np.conj(S))
+        c_lin = c[: 2 * N - 1]
+        k = np.argmax(np.abs(c_lin))
+        lag = k - (N - 1)
+        return int(lag)
+
+    results = []
+    for i in range(rx.shape[0]):
+        r = rx[i]
+        s = ref[i]
+        lag = est_delay_fft(r, s)
+        r_aligned = np.roll(r, -lag)
+
+        num = np.vdot(s, r_aligned)
+        den = np.linalg.norm(s) * np.linalg.norm(r_aligned) + 1e-12
+        corr = num / den
+
+        e = r_aligned * np.conj(s)
+        ang = np.unwrap(np.angle(e))
+        n = np.arange(len(e))
+        A = np.vstack([n, np.ones_like(n)]).T
+        slope, _ = np.linalg.lstsq(A, ang, rcond=None)[0]
+        cfo = (slope / (2 * np.pi)) * fs
+        results.append({"lag": lag, "corr": corr, "cfo": cfo})
+    return results
+
+
+if __name__ == "__main__":
+    chan, chirp, rx = full_duplex_txrx(config)
+    # 归一化仅用于显示与稳定度量
+    chirp = chirp / (np.max(np.abs(chirp)) + 1e-12)
+    rx = rx / (np.max(np.abs(rx)) + 1e-12)
+    res = verify_chirp(chirp, rx, float(config["sample_rate"]))
+
+    for i, r in enumerate(res):
+        corr = r["corr"]
+        print(
+            f"ch{i}: lag={r['lag']} samp, |corr|={np.abs(corr):.4f}, angle={np.angle(corr):+.3f} rad, CFO={r['cfo']:+.1f} Hz"
+        )
+
+    # 简单可视化：对齐后时域对比（实部）
+    if len(chan) > 0:
+        lag0 = res[0]["lag"]
+        rx0_aligned = np.roll(rx[0], -lag0)
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(y=np.real(chirp[0]), name="tx chirp real ch0", opacity=0.6)
+        )
+        fig.add_trace(
+            go.Scatter(
+                y=np.real(rx0_aligned), name="rx real ch0 (aligned)", opacity=0.6
+            )
+        )
+        fig.update_layout(
+            title="Chirp TX/RX time-domain (real) ch0", legend=dict(orientation="h")
+        )
+        fig.show()
+
+    if len(chan) > 1:
+        lag1 = res[1]["lag"]
+        rx1_aligned = np.roll(rx[1], -lag1)
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(y=np.real(chirp[1]), name="tx chirp real ch1", opacity=0.6)
+        )
+        fig.add_trace(
+            go.Scatter(
+                y=np.real(rx1_aligned), name="rx real ch1 (aligned)", opacity=0.6
+            )
+        )
+        fig.update_layout(
+            title="Chirp TX/RX time-domain (real) ch1", legend=dict(orientation="h")
+        )
+        fig.show()
