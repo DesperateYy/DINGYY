@@ -10,7 +10,7 @@ config = {
     "center_freq": 2e9,       # 【修改】中心频率 2 GHz
     "sample_rate": 10e4,      # 采样率 100 kHz (维持之前成功观察到调制效果的设置)
     "tx_gain": 70,            # 发射增益 (您可以根据实际信号质量微调)
-    "rx_gain": 70,            # 接收增益 (您可以根据实际信号质量微调)
+    "rx_gain": 60,            # 接收增益 (您可以根据实际信号质量微调)
     "duration": 1.0,          # 采集1秒数据
     "tx_chan": [0, 1],        # 2T2R模式
     "rx_chan": [0, 1],        # 2T2R模式
@@ -23,7 +23,7 @@ config = {
 }
 
 
-# (build_chirp 函数与之前完全相同)
+# build_chirp 函数 (与之前完全相同)
 def build_chirp(cfg):
     num_samps = int(cfg["num_samps_per_frame"]);
     fs = float(cfg["sample_rate"]);
@@ -45,7 +45,7 @@ if __name__ == "__main__":
     print(f"Chirp Bandwidth: {(config['chirp_f1'] - config['chirp_f0'])/1e3:.1f} kHz")
     print(f"Will save data to: {config['output_filename']}")
 
-    # (SDR初始化和连续流收发的代码与之前完全相同)
+    # SDR初始化和连续流收发的代码 (与之前完全相同)
     usrp = uhd.usrp.MultiUSRP()
     for chan in config['tx_chan']: usrp.set_tx_rate(float(config["sample_rate"]), chan); usrp.set_tx_freq(
         uhd.libpyuhd.types.tune_request(float(config["center_freq"])), chan); usrp.set_tx_gain(float(config["tx_gain"]),
