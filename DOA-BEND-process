@@ -1,155 +1,139 @@
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from scipy.io import loadmat
 from scipy.linalg import solve
 
-# --- TMA 和 DOA 算法参数 ---
-DEFAULT_DATA_FILENAME = "captured_tma_data_2ghz.mat"  # 【修改】加载 2GHz 的数据
-
-SWITCHING_FREQ = 10e3  # 10 kHz (您的FPGA实际开关频率)
-NUM_ANTENNA_ELEMENTS = 2
-
-antenna_params = {
-    "d": 0.07,  # 【修改】天线间距设置为 0.07 米
-    "n_values": 5
-}
-switch_params = {"fm": SWITCHING_FREQ, "N": NUM_ANTENNA_ELEMENTS, "ratio": 0.5}
-switch_params["Tm"] = 1 / switch_params["fm"]
-
-c = 3e8
+# --- 1. 参数设置 (必须与采集脚本和物理硬件一致) ---
+DATA_FILE = "captured_tma_data_2ghz.mat"  # 对应采集脚本的输出文件名
+SWITCHING_FREQ = 10e3  # 10 kHz (TMA 开关频率)
+ANTENNA_D = 0.05  # 【关键】5厘米间距 (物理测量值，需 < 7.5cm)
+C = 3e8  # 光速
 
 if __name__ == "__main__":
-    data_filename = DEFAULT_DATA_FILENAME
-    print(f"--- Signal Processing, Plotting, and DOA Estimation Script (2 GHz) ---")
-    print(f"▶️  Loading real hardware data from {data_filename}...")
+    print(f"--- TMA Processing & DOA Estimation (Target: 2 GHz, d={ANTENNA_D}m) ---")
 
+    # --- 2. 加载数据 ---
     try:
-        mat_data = loadmat(data_filename)
-        x_TMA_noisy = mat_data['tma_signal_raw'].flatten()
-        s_ref_raw = mat_data['ref_signal_raw'].flatten()
-        raw_config_void = mat_data['config'][0, 0]
-        config_loaded = {}
-        for key in raw_config_void.dtype.names:
-            value = raw_config_void[key]
-            if isinstance(value, np.ndarray) and value.size == 1:
-                config_loaded[key] = value.item()
-            else:
-                config_loaded[key] = value
-        print("✅  Data loaded successfully.")
+        mat = loadmat(DATA_FILE)
+        # Flatten 将数组展平，防止维度问题
+        tma = mat['tma_signal_raw'].flatten()
+        ref = mat['ref_signal_raw'].flatten()
+
+        # 尝试从文件中读取配置，如果失败则使用默认值 (增强鲁棒性)
+        try:
+            cfg = mat['config'][0, 0]
+            fs = float(cfg['sample_rate'].item())
+            f0 = float(cfg['center_freq'].item())
+        except:
+            fs = 10e4
+            f0 = 2e9
+            print("⚠️ Warning: Could not read config from file, using defaults (fs=100k, f0=2G)")
+
+        print(f"✅ Data loaded successfully.")
+        print(f"   Sample Rate: {fs / 1e3:.1f} kHz")
+        print(f"   Center Freq: {f0 / 1e9:.3f} GHz")
+
     except FileNotFoundError:
-        print(f"❌ Error: Data file '{data_filename}' not found. Please run 'acquire_data_2ghz.py' first.")
+        print(f"❌ Error: File '{DATA_FILE}' not found. Please run the acquisition script first.")
         exit()
     except Exception as e:
         print(f"❌ Error loading data: {e}")
         exit()
 
-    # --- 使用加载的配置参数 ---
-    fs = config_loaded['sample_rate']
-    f0 = config_loaded['center_freq']  # 载波中心频率 (从文件中加载的 2 GHz)
+    # --- 3. 核心算法：脉冲压缩 ---
+    # 原理：TMA信号 乘以 参考信号的共轭 (去Chirp，还原单频谐波)
+    print("▶️  Performing Pulse Compression (y = tma * conj(ref))...")
+    y_pc = tma * np.conj(ref)
 
-    lambda_0 = c / f0
-    lambda_0_half = lambda_0 / 2
+    # --- 4. 绘图验证：脉冲压缩后的频谱 ---
+    # 预期：原本宽带的信号应该变成了 0Hz, ±10kHz, ±20kHz... 处的一系列尖峰
+    print("▶️  Generating verification plot...")
+    M = len(y_pc)
+    freqs = np.fft.fftshift(np.fft.fftfreq(M, d=1 / fs))
+    spec_pc = np.fft.fftshift(np.fft.fft(y_pc))
+    spec_db = 20 * np.log10(np.abs(spec_pc) + 1e-12)
 
-    print(f"   Carrier Frequency (f0): {f0 / 1e9:.3f} GHz")
-    print(f"   Sampling Rate (fs): {fs / 1e3:.1f} kHz")
-    print(f"   Switching Frequency (fm): {switch_params['fm'] / 1e3:.1f} kHz")
-    print(f"   Wavelength (lambda_0): {lambda_0:.4f} meters")
-    print(f"   Half-Wavelength (lambda_0/2): {lambda_0_half:.4f} meters")
-    print(f"   Antenna Spacing (d): {antenna_params['d']:.4f} meters (Configured)")
-
-    # 【修改】移除了栅瓣警告
-
-    # --- 1. 脉冲压缩 ---
-    print("▶️  Performing pulse compression (TMA signal * conj(Reference signal))...")
-    y_processed = x_TMA_noisy * np.conj(s_ref_raw)
-    print("✅  Pulse compression complete.")
-
-    # --- 2. 准备频谱分析参数 ---
-    M = len(x_TMA_noisy);
-    t = np.arange(0, M / fs, 1 / fs);
-    fft_freq = np.fft.fftshift(np.fft.fftfreq(M, d=1 / fs))
-    fft_ref = np.fft.fftshift(np.fft.fft(s_ref_raw))
-    fft_tma = np.fft.fftshift(np.fft.fft(x_TMA_noisy))
-    fft_processed = np.fft.fftshift(np.fft.fft(y_processed))
-
-    # --- 3. 绘制所有关键频谱图 ---
-    print("▶️  Generating spectrum plots...")
-    fig = make_subplots(rows=3, cols=1, subplot_titles=(
-    "Spectrum of Reference Signal (RXB)", "Spectrum of TMA Modulated Signal (RXA)",
-    "Spectrum After Pulse Compression (TMA * conj(Reference))"))
-    fig.add_trace(
-        go.Scatter(x=fft_freq / 1e3, y=20 * np.log10(np.abs(fft_ref) + 1e-12), mode='lines', name='Reference Spectrum'),
-        row=1, col=1)
-    fig.update_xaxes(title_text="Frequency Offset (kHz)", range=[-fs / 2 / 1e3, fs / 2 / 1e3], row=1, col=1)
-    fig.update_yaxes(title_text="Power (dB)", row=1, col=1)
-    fig.add_trace(
-        go.Scatter(x=fft_freq / 1e3, y=20 * np.log10(np.abs(fft_tma) + 1e-12), mode='lines', name='TMA Spectrum'),
-        row=2, col=1)
-    fig.update_xaxes(title_text="Frequency Offset (kHz)", range=[-fs / 2 / 1e3, fs / 2 / 1e3], row=2, col=1)
-    fig.update_yaxes(title_text="Power (dB)", row=2, col=1)
-    fig.add_trace(go.Scatter(x=fft_freq / 1e3, y=20 * np.log10(np.abs(fft_processed) + 1e-12), mode='lines',
-                             name='Pulse-Compressed Spectrum'), row=3, col=1)
-    display_range_khz = (switch_params["fm"] * (antenna_params["n_values"] + 1)) / 1e3
-    fig.update_xaxes(title_text="Frequency Offset (kHz)", range=[-display_range_khz, display_range_khz], row=3, col=1)
-    fig.update_yaxes(title_text="Power (dB)", range=[0, 70], row=3, col=1)  # 调整Y轴范围
-    fig.update_layout(height=1000,
-                      title_text="Signal Analysis: Reference, TMA Modulated, and Pulse-Compressed Spectra (2 GHz)",
-                      showlegend=False)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=freqs / 1e3, y=spec_db, mode='lines', name='Pulse Compressed'))
+    fig.update_layout(
+        title="Spectrum After Pulse Compression (Verification)",
+        xaxis_title="Frequency Offset (kHz)",
+        yaxis_title="Power (dB)",
+        template="plotly_white"
+    )
+    # 限制显示范围在 ±50kHz，方便观察谐波结构
+    fig.update_xaxes(range=[-50, 50])
     fig.show()
-    print("✅  All spectrum plots generated.")
 
-    # --- 4. DOA 测角算法部分 ---
-    print("\n--- Starting DOA Estimation ---")
+    # --- 5. DOA 测角算法 ---
+    print("▶️  Calculating Direction of Arrival (DOA)...")
 
-    # a) 提取谐波复数值
-    print("▶️  Extracting harmonic complex values...")
-    Y = np.fft.fft(y_processed) / M;
-    df = fs / M
-    r_list = np.arange(-antenna_params["n_values"], antenna_params["n_values"] + 1);
-    f_list = r_list * switch_params["fm"]
-    bins = np.array([int(np.round(f / df)) % M for f in f_list])
-    bins_unique, unique_idx = np.unique(bins, return_index=True);
-    bins = bins_unique;
-    r_list_filtered = r_list[unique_idx]
-    tildeY = Y[bins]
+    # A. 提取谐波复数值
+    # 我们需要提取 0, ±10k, ±20k... 处的复数值
+    n_harmonics = 5
+    target_freqs = np.arange(-n_harmonics, n_harmonics + 1) * SWITCHING_FREQ
 
-    # b) 构建开关谐波响应矩阵 (M_matrix)
-    print("▶️  Constructing switch harmonic response matrix (M_matrix)...")
+    Y_raw = np.fft.fft(y_pc) / M  # 归一化FFT
+    freqs_raw = np.fft.fftfreq(M, d=1 / fs)
 
-
-    def genSwitch(t_local, Tm, Ton, Toff):
-        tt = np.mod(t_local, Tm);
-        return ((tt >= Ton) & (tt < Toff)).astype(float) if Ton < Toff else ((tt >= Ton) | (tt < Toff)).astype(float)
+    tildeY = []
+    for f_target in target_freqs:
+        # 在FFT结果中找到距离目标频率最近的点 (鲁棒性更好)
+        idx = np.argmin(np.abs(freqs_raw - f_target))
+        tildeY.append(Y_raw[idx])
+    tildeY = np.array(tildeY)
 
 
-    def genAllSwitch(switch_cfg, t_vec):
-        switchs = np.zeros((switch_cfg["N"], t_vec.size), dtype=float)
-        switchs[0, :] = genSwitch(t_vec, switch_cfg["Tm"], 0, switch_cfg["Tm"] * switch_cfg["ratio"])
-        switchs[1, :] = genSwitch(t_vec, switch_cfg["Tm"], switch_cfg["Tm"] * switch_cfg["ratio"], switch_cfg["Tm"])
-        return np.fft.fft(switchs, axis=1) / M
+    # B. 构建系统矩阵 (M Matrix)
+    # 模拟开关的理论谐波系数
+    def get_switch_coeffs(N_harmonics):
+        T_sim = 1.0
+        dt = 0.001
+        t = np.arange(0, T_sim, dt)
+
+        # 互补开关时序：Ant1前半周期，Ant2后半周期
+        sw1 = ((t >= 0) & (t < 0.5)).astype(float)
+        sw2 = ((t >= 0.5) & (t < 1.0)).astype(float)
+
+        S1 = np.fft.fft(sw1) / len(t)
+        S2 = np.fft.fft(sw2) / len(t)
+        freqs_sim = np.fft.fftfreq(len(t), d=dt)
+
+        coeffs = np.zeros((2 * N_harmonics + 1, 2), dtype=complex)
+        for i, k in enumerate(range(-N_harmonics, N_harmonics + 1)):
+            idx = np.argmin(np.abs(freqs_sim - k))
+            coeffs[i, 0] = S1[idx]
+            coeffs[i, 1] = S2[idx]
+        return coeffs
 
 
-    M_fft = genAllSwitch(switch_params, t);
-    M_matrix = np.zeros((len(bins), switch_params["N"]), dtype=complex)
-    for i, b in enumerate(bins): M_matrix[i, :] = M_fft[:, b]
-    print("✅  M_matrix constructed.")
+    M_matrix = get_switch_coeffs(n_harmonics)
 
-    # c) 求解DOA
-    print("▶️  Solving for DOA (Direction of Arrival)...")
-    lambda_reg = 1e-6
-    a_hat = solve(M_matrix.conj().T @ M_matrix + lambda_reg * np.eye(switch_params["N"]), M_matrix.conj().T @ tildeY)
+    # C. 求解天线系数 (a_hat)
+    # tildeY = M_matrix * a_hat  -->  a_hat = pinv(M) * tildeY
+    a_hat = np.linalg.pinv(M_matrix) @ tildeY
+
+    # D. 计算相位差
+    # 两个系数的相位差就是空间相位差
     phase_diff = np.angle(a_hat[1]) - np.angle(a_hat[0])
-    mean_phase_diff = phase_diff
-    sin_theta_hat = np.clip((mean_phase_diff * c) / (2 * np.pi * f0 * antenna_params["d"]), -1, 1)
-    theta_hat_rad = np.arcsin(sin_theta_hat)
-    theta_hat_deg = np.degrees(theta_hat_rad)
-    print("✅  DOA estimation complete.")
 
-    print("\n-------------------------------------")
-    print("--- DOA Estimation Result ---")
-    print(f"Carrier Frequency (f0): {f0 / 1e9:.3f} GHz")
-    print(f"Antenna Spacing (d): {antenna_params['d']:.4f} meters (Configured)")
-    print(f"Estimated Phase Difference: {np.degrees(mean_phase_diff):.3f} degrees")
-    print(f"Estimated Angle (DOA): {theta_hat_deg:.3f} degrees")
-    print("-------------------------------------")
+    # 将相位归一化到 -pi 到 +pi 之间
+    phase_diff = (phase_diff + np.pi) % (2 * np.pi) - np.pi
+
+    # E. 反解角度 (theta)
+    # sin(theta) = (phase_diff * c) / (2 * pi * f0 * d)
+    val = (phase_diff * C) / (2 * np.pi * f0 * ANTENNA_D)
+
+    # 安全裁剪，防止因噪声导致的数值溢出 (sin值 > 1)
+    val = np.clip(val, -1.0, 1.0)
+
+    theta_rad = np.arcsin(val)
+    theta_deg = np.degrees(theta_rad)
+
+    # --- 6. 输出结果 ---
+    print("\n" + "=" * 40)
+    print(f"RESULTS (f0={f0 / 1e9:.2f}G, d={ANTENNA_D * 100:.1f}cm)")
+    print("-" * 40)
+    print(f"Calculated Phase Difference : {np.degrees(phase_diff):.3f}°")
+    print(f"Estimated DOA Angle         : {theta_deg:.3f}°")
+    print("=" * 40 + "\n")
