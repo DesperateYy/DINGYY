@@ -1,121 +1,128 @@
 import uhd
 import numpy as np
 import threading
+import time
 from scipy.io import savemat
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # --- 1. 配置参数 ---
 config = {
-    "center_freq": 1e9,  # 中心频率 2 GHz
-    "sample_rate": 10e4,  # 采样率 100 kHz
-    "tx_gain": 60,  # 发射增益 (您可以根据实际信号质量微调)
-    "rx_gain": 60,  # 接收增益 (您可以根据实际信号质量微调)
-    "duration": 1.0,  # 采集1秒数据
-    "tx_chan": [0, 1],  # 2T2R模式
-    "rx_chan": [0, 1],  # 2T2R模式
-
+    "center_freq": 2e9,  # 【修改】中心频率 2 GHz
+    "sample_rate": 10e4,  # 100 kHz
+    "tx_gain": 50,  # 发射增益
+    "rx_gain": 40,  # 接收增益
+    "duration": 1.0,  # 采集时长
+    "tx_chan": [0, 1],
+    "rx_chan": [0, 1],
     "tx_amp": 0.7,
-    # 【修改】移除了Chirp参数
-    "output_filename": "captured_tma_data_cw_2ghz.mat"  # 【修改】输出文件名
+    "num_samps_per_frame": 8192,
+    "output_filename": "tma_data_cw_2ghz.mat"  # 【修改】输出文件名
 }
 
-# 【修改】不再需要build_chirp函数
-
-
 if __name__ == "__main__":
-    print(f"--- Data Acquisition Script (CW / Sine Wave) @ 2 GHz ---")
-    print(f"Center Frequency: {config['center_freq'] / 1e9:.1f} GHz")
-    print(f"Sampling Rate: {config['sample_rate'] / 1e3:.1f} kHz")
-    print(f"Will save data to: {config['output_filename']}")
+    print(f"--- CW Data Acquisition (FIXED ALIGNMENT, 2 GHz) ---")
 
-    # SDR初始化和连续流收发的代码
-    usrp = uhd.usrp.MultiUSRP()
-    for chan in config['tx_chan']: usrp.set_tx_rate(float(config["sample_rate"]), chan); usrp.set_tx_freq(
-        uhd.libpyuhd.types.tune_request(float(config["center_freq"])), chan); usrp.set_tx_gain(float(config["tx_gain"]),
-                                                                                               chan)
-    for chan in config['rx_chan']: usrp.set_rx_rate(float(config["sample_rate"]), chan); usrp.set_rx_freq(
-        uhd.libpyuhd.types.tune_request(float(config["center_freq"])), chan); usrp.set_rx_gain(float(config["rx_gain"]),
-                                                                                               chan)
-    tx_args = uhd.usrp.StreamArgs("fc32", "sc16");
-    tx_args.channels = config['tx_chan'];
+    # 1. 连接设备
+    try:
+        usrp = uhd.usrp.MultiUSRP()
+    except RuntimeError:
+        print("❌ Error: No USRP device found. Please unplug/replug USB and try again.")
+        exit()
+
+    # 2. 设置参数
+    for chan in config['tx_chan']:
+        usrp.set_tx_rate(float(config["sample_rate"]), chan)
+        usrp.set_tx_freq(uhd.libpyuhd.types.tune_request(float(config["center_freq"])), chan)
+        usrp.set_tx_gain(float(config["tx_gain"]), chan)
+    for chan in config['rx_chan']:
+        usrp.set_rx_rate(float(config["sample_rate"]), chan)
+        usrp.set_rx_freq(uhd.libpyuhd.types.tune_request(float(config["center_freq"])), chan)
+        usrp.set_rx_gain(float(config["rx_gain"]), chan)
+
+    # 分两步设置 StreamArgs
+    tx_args = uhd.usrp.StreamArgs("fc32", "sc16")
+    tx_args.channels = config['tx_chan']
     tx_streamer = usrp.get_tx_stream(tx_args)
-    rx_args = uhd.usrp.StreamArgs("fc32", "sc16");
-    rx_args.channels = config['rx_chan'];
+
+    rx_args = uhd.usrp.StreamArgs("fc32", "sc16")
+    rx_args.channels = config['rx_chan']
     rx_streamer = usrp.get_rx_stream(rx_args)
 
-    # 【修改】生成一个纯CW（正弦波）信号
-    # 在基带，纯正弦波就是一个直流(DC)复数值
-    tx_frame_buffer_size = 4096  # 流式传输的缓冲区大小
-    tx_frame = np.full(tx_frame_buffer_size, config["tx_amp"] * (1.0 + 0.0j), dtype=np.complex64)
+    # --- 生成 CW 信号 ---
+    # 生成一个 20kHz 的频偏信号，避开 0Hz 的直流泄漏
+    t_vec = np.arange(config["num_samps_per_frame"]) / config["sample_rate"]
+    freq_offset = 20e3  # 20 kHz
+    tx_frame = (config["tx_amp"] * np.exp(1j * 2 * np.pi * freq_offset * t_vec)).astype(np.complex64)
+    tx_wave = np.zeros((2, len(tx_frame)), dtype=np.complex64)
+    tx_wave[0, :] = tx_frame
 
-    tx_wave = np.zeros((2, len(tx_frame)), dtype=np.complex64);
-    tx_wave[0, :] = tx_frame  # 只在TRXA上发射
-
-    stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont);
-    stream_cmd.stream_now = False;
-    stream_cmd.time_spec = usrp.get_time_now() + uhd.types.TimeSpec(0.1);
-    rx_streamer.issue_stream_cmd(stream_cmd)
+    # --- 发送线程 (保持无时间戳模式，防止发射中断) ---
     stop_sending = threading.Event()
 
 
     def continuous_send():
-        tx_md = uhd.types.TXMetadata();
-        tx_md.start_of_burst = False;
-        tx_md.has_time_spec = True;
-        tx_md.time_spec = stream_cmd.time_spec
-        first_packet = True
+        tx_md = uhd.types.TXMetadata()
+        tx_md.start_of_burst = False
+        tx_md.has_time_spec = False
         while not stop_sending.is_set():
             tx_streamer.send(tx_wave, tx_md)
-            if first_packet: tx_md.has_time_spec = False; first_packet = False
 
 
-    send_thread = threading.Thread(target=continuous_send);
+    print("▶️  Starting TX (CW Signal)...")
+    send_thread = threading.Thread(target=continuous_send)
     send_thread.start()
-    num_samps_to_recv = int(config["duration"] * config["sample_rate"]);
-    rx_buffer = np.zeros((2, num_samps_to_recv), dtype=np.complex64)
-    print(f"▶️  Receiving {num_samps_to_recv} samples on 2 channels...")
-    samples_received = rx_streamer.recv(rx_buffer, uhd.types.RXMetadata(), config["duration"] + 1.0)
-    stop_sending.set();
+
+    print("⏳ Waiting 0.5s for signal stabilization...")
+    time.sleep(0.5)
+
+    print("▶️  Starting RX capture (With Time-Alignment)...")
+
+    # --- 【关键修正】RX使用时间戳启动，解决 "stream now on multiple channels" 错误 ---
+    stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont)
+    stream_cmd.stream_now = False
+    # 设定启动时间为：现在 + 0.1秒
+    # 这保证了两个接收通道 (RXA/RXB) 严格相位对齐
+    stream_cmd.time_spec = usrp.get_time_now() + uhd.types.TimeSpec(0.1)
+    rx_streamer.issue_stream_cmd(stream_cmd)
+    # -----------------------------------------------------------------------
+
+    num_samps = int(config["duration"] * config["sample_rate"])
+    rx_buffer = np.zeros((2, num_samps), dtype=np.complex64)
+
+    # 接收数据
+    # 注意：这里可能会稍微阻塞一下，直到 time_spec 到达
+    rx_streamer.recv(rx_buffer, uhd.types.RXMetadata(), config["duration"] + 1.0)
+
+    # 停止
+    stop_sending.set()
     send_thread.join()
     rx_streamer.issue_stream_cmd(uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont))
-    print(f"✅  Acquisition complete. Received {samples_received} samples.")
+    print(f"✅  Acquisition complete.")
 
-    tma_signal = rx_buffer[0, :samples_received]  # RXA (TMA)
-    ref_signal = rx_buffer[1, :samples_received]  # RXB (Reference)
+    tma_signal = rx_buffer[0, :]
+    ref_signal = rx_buffer[1, :]
 
-    # --- 实时验证绘图 ---
-    if len(ref_signal) > 0 and len(tma_signal) > 0:
-        print("▶️  Plotting live verification spectra...")
+    # --- 验证绘图 ---
+    if len(tma_signal) > 0:
+        print("▶️  Plotting verification spectra...")
         fig = make_subplots(rows=2, cols=1,
-                            subplot_titles=("Spectrum on RXB (Reference Channel)", "Spectrum on RXA (TMA Channel)"))
+                            subplot_titles=("RXB: Ref (Expect Single Sharp Peak)", "RXA: TMA (Expect Harmonic Peaks)"))
 
-        # 预期：RXB应该是一个在0Hz处非常尖锐的峰值（可能有小的频偏）
-        NFFT_ref = len(ref_signal);
-        fft_ref = np.fft.fftshift(np.fft.fft(ref_signal));
-        fft_freq_ref = np.fft.fftshift(np.fft.fftfreq(NFFT_ref, d=1 / config["sample_rate"]));
-        fft_db_ref = 20 * np.log10(np.abs(fft_ref) + 1e-12)
-        fig.add_trace(go.Scatter(x=fft_freq_ref / 1e3, y=fft_db_ref, mode='lines', name='Reference Spectrum'), row=1,
-                      col=1)
+        N = len(ref_signal)
+        f = np.fft.fftshift(np.fft.fftfreq(N, d=1 / config["sample_rate"]))
 
-        # 预期：RXA应该是0Hz, ±10kHz, ±30kHz... 处的尖锐峰值
-        NFFT_tma = len(tma_signal);
-        fft_tma = np.fft.fftshift(np.fft.fft(tma_signal));
-        fft_freq_tma = np.fft.fftshift(np.fft.fftfreq(NFFT_tma, d=1 / config["sample_rate"]));
-        fft_db_tma = 20 * np.log10(np.abs(fft_tma) + 1e-12)
-        fig.add_trace(go.Scatter(x=fft_freq_tma / 1e3, y=fft_db_tma, mode='lines', name='TMA Spectrum'), row=2, col=1)
+        y_ref = 20 * np.log10(np.abs(np.fft.fftshift(np.fft.fft(ref_signal))) + 1e-12)
+        fig.add_trace(go.Scatter(x=f / 1e3, y=y_ref, name='Ref (RXB)'), row=1, col=1)
 
-        fig.update_layout(height=800, title_text="Live Verification of Acquired Signals (CW @ 2 GHz)", showlegend=False)
-        fig.update_xaxes(title_text="Frequency Offset (kHz)",
-                         range=[-config["sample_rate"] / 2 / 1e3, config["sample_rate"] / 2 / 1e3], row=1, col=1)
-        fig.update_xaxes(title_text="Frequency Offset (kHz)",
-                         range=[-config["sample_rate"] / 2 / 1e3, config["sample_rate"] / 2 / 1e3], row=2, col=1)
-        fig.update_yaxes(title_text="Power (dB)", row=1, col=1);
-        fig.update_yaxes(title_text="Power (dB)", row=2, col=1)
+        y_tma = 20 * np.log10(np.abs(np.fft.fftshift(np.fft.fft(tma_signal))) + 1e-12)
+        fig.add_trace(go.Scatter(x=f / 1e3, y=y_tma, name='TMA (RXA)'), row=2, col=1)
+
+        fig.update_xaxes(title_text="Freq Offset (kHz)", row=2, col=1)
+        fig.update_yaxes(title_text="dB", row=1, col=1)
+        fig.update_yaxes(title_text="dB", row=2, col=1)
+        fig.update_layout(height=800, title=f"CW Signal Verification (2 GHz)")
         fig.show()
 
-    # --- 保存数据 ---
-    print(f"▶️  Saving data to {config['output_filename']}...")
-    save_dict = {"tma_signal_raw": tma_signal, "ref_signal_raw": ref_signal, "config": config}
-    savemat(config['output_filename'], save_dict)
-    print(f"✅  Data saved successfully.")
+    savemat(config['output_filename'], {"tma_signal_raw": tma_signal, "ref_signal_raw": ref_signal, "config": config})
+    print(f"✅  Data saved to {config['output_filename']}")
