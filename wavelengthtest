@@ -1,0 +1,161 @@
+import uhd
+import numpy as np
+import threading
+import time
+import plotly.graph_objects as go
+
+# ==========================================
+# 🔧 实验配置 (1GHz, 纯正弦)
+# ==========================================
+CENTER_FREQ = 1.0e9  # 1GHz
+SAMPLE_RATE = 1e6  # 1MHz
+TX_GAIN = 90
+RX_GAIN = 90
+
+# 【核心验证点】
+# True = 老师建议的纯正弦 (0Hz) -> 验证是否受LO泄露影响
+# False = 加频偏模式 (对照组)
+USE_PURE_CW = False
+
+
+# ==========================================
+
+def continuous_send(streamer, wave, stop_event):
+    """发射线程"""
+    metadata = uhd.types.TXMetadata()
+    metadata.start_of_burst = False
+    metadata.has_time_spec = False
+    while not stop_event.is_set():
+        streamer.send(wave, metadata)
+
+
+def capture_and_measure(rx_streamer, num_samps=4096):
+    """采集并计算相位"""
+    rx_buff = np.zeros((2, num_samps), dtype=np.complex64)
+    stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.num_done)
+    stream_cmd.num_samps = num_samps
+    stream_cmd.stream_now = False
+    stream_cmd.time_spec = usrp.get_time_now() + uhd.types.TimeSpec(0.05)
+    rx_streamer.issue_stream_cmd(stream_cmd)
+    rx_streamer.recv(rx_buff, uhd.types.RXMetadata())
+
+    sig_a = rx_buff[0, :]  # 移动天线
+    sig_b = rx_buff[1, :]  # 参考天线 (不动)
+
+    # 计算 RXA 相对于 RXB 的相位差
+    # 这样可以消除 SDR 每次启动时的随机相位跳变
+    correlation = sig_a * np.conj(sig_b)
+    avg_phase_rad = np.angle(np.mean(correlation))
+    return np.degrees(avg_phase_rad)
+
+
+if __name__ == "__main__":
+    print(f"\n{'=' * 60}")
+    print(f"--- 1GHz 波长相位验证 (Wavelength Verification) ---")
+    print(f"模式: {'纯正弦 (Pure CW)' if USE_PURE_CW else '带频偏 (Offset)'}")
+    print(f"理论目标: 移动 30cm -> 相位变化 360度")
+    print(f"{'=' * 60}\n")
+
+    # 1. 初始化
+    try:
+        usrp = uhd.usrp.MultiUSRP()
+    except RuntimeError:
+        print("❌ 找不到 USRP")
+        exit()
+
+    for chan in [0, 1]:
+        usrp.set_tx_rate(SAMPLE_RATE, chan)
+        usrp.set_rx_rate(SAMPLE_RATE, chan)
+        usrp.set_tx_freq(uhd.libpyuhd.types.tune_request(CENTER_FREQ), chan)
+        usrp.set_rx_freq(uhd.libpyuhd.types.tune_request(CENTER_FREQ), chan)
+        usrp.set_tx_gain(TX_GAIN, chan)
+        usrp.set_rx_gain(RX_GAIN, chan)
+
+    # 2. 准备流
+    st_args = uhd.usrp.StreamArgs("fc32", "sc16");
+    st_args.channels = [0, 1]
+    tx_streamer = usrp.get_tx_stream(st_args)
+    rx_streamer = usrp.get_rx_stream(st_args)
+
+    # 3. 发射信号
+    num_samps = 8192
+    if USE_PURE_CW:
+        # 纯直流 (对应射频纯载波)
+        tx_data = 0.7 * np.ones(num_samps, dtype=np.complex64)
+    else:
+        # 20kHz 频偏
+        t = np.arange(num_samps) / SAMPLE_RATE
+        tx_data = 0.7 * np.exp(1j * 2 * np.pi * 20e3 * t).astype(np.complex64)
+
+    tx_buffer = np.stack([tx_data, tx_data])
+    stop_sending = threading.Event()
+    tx_thread = threading.Thread(target=continuous_send, args=(tx_streamer, tx_buffer, stop_sending))
+    tx_thread.start()
+
+    print("🚀 信号发射中... 请布置好尺子。")
+    time.sleep(1.0)
+
+    # 4. 记录循环
+    distances = []
+    phases = []
+
+    try:
+        while True:
+            user_input = input("\n请输入 RXA 移动距离(cm) [输入 'exit' 绘图]: ").strip()
+            if user_input.lower() == 'exit':
+                break
+
+            try:
+                dist = float(user_input)
+
+                # 连测 10 次取平均，稍微平滑一点数据
+                temp_p = []
+                for _ in range(10):
+                    p = capture_and_measure(rx_streamer)
+                    temp_p.append(p)
+                    time.sleep(0.02)
+
+                # 矢量平均
+                avg_vec = np.mean(np.exp(1j * np.radians(temp_p)))
+                curr_phase = np.degrees(np.angle(avg_vec))
+
+                print(f"   📏 距离 {dist} cm -> 相位读数: {curr_phase:.2f}°")
+                distances.append(dist)
+                phases.append(curr_phase)
+
+            except ValueError:
+                print("❌ 请输入数字")
+
+    finally:
+        stop_sending.set()
+        tx_thread.join()
+
+        # 5. 绘图
+        if len(distances) > 0:
+            # 排序
+            idx = np.argsort(distances)
+            d_sorted = np.array(distances)[idx]
+            p_sorted = np.array(phases)[idx]
+
+            # 解卷绕 (Unwrap): 把跳变的相位连成直线
+            # 比如 179 -> -179 变成 179 -> 181
+            p_unwrapped = np.degrees(np.unwrap(np.radians(p_sorted)))
+
+            # 计算总变化量
+            total_change = p_unwrapped[-1] - p_unwrapped[0]
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=d_sorted, y=p_sorted, mode='markers', name='原始测量点'))
+            fig.add_trace(go.Scatter(x=d_sorted, y=p_unwrapped, mode='lines+markers', name='连续相位趋势'))
+
+            fig.update_layout(
+                title=f"1GHz Wavelength Verify (PureSine={USE_PURE_CW}) | Total Change: {total_change:.1f}°",
+                xaxis_title="Distance (cm)",
+                yaxis_title="Phase (Degrees)",
+                annotations=[dict(
+                    x=0.5, y=1.05, xref='paper', yref='paper',
+                    text=f"Expectation: 30cm ≈ 360° | Actual: {total_change:.1f}°",
+                    showarrow=False
+                )]
+            )
+            fig.show()
