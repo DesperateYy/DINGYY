@@ -1,0 +1,153 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.io import loadmat
+
+# ================= 1. 关键物理参数 =================
+DATA_FILE = "bendcaptured_tma_data_2.485ghz10.mat"  # 请确保文件在同目录下
+ANTENNA_DISTANCE = 0.06  # 天线间距 6cm
+SWITCHING_FREQ = 10e3  # 调制频率 10kHz
+
+if __name__ == "__main__":
+    print(f"--- TMA De-chirp & LS Angle Estimation (Matplotlib Version) ---")
+
+    # --- 2. 加载数据 ---
+    try:
+        mat = loadmat(DATA_FILE)
+        tma = mat['tma_signal_raw'].flatten()  # RXA (Modulated)
+        ref = mat['ref_signal_raw'].flatten()  # RXB (Reference)
+
+        try:
+            cfg = mat['config'][0, 0]
+            fs = float(cfg['sample_rate'].item())
+            center_freq = float(cfg['center_freq'].item())
+        except:
+            fs = 10e4  # 默认 100k
+            center_freq = 2.485e9  # 默认 2.485G
+            print("⚠️ Warning: Using default config (fs=100k, f0=2.485G)")
+
+        lambda_val = 3e8 / center_freq
+        print(f"✅ Data loaded. Freq: {center_freq / 1e9:.3f} GHz, Lambda: {lambda_val * 100:.2f} cm")
+
+    except FileNotFoundError:
+        print(f"❌ Error: File '{DATA_FILE}' not found.")
+        exit()
+
+    # --- 3. 核心处理：去斜 (Pulse Compression) ---
+    y_pc = tma * np.conj(ref)
+
+    # --- 4. 频谱提取 (包含 RXB, RXA, De-chirped) ---
+    N = len(y_pc)
+    window = np.hamming(N)  # 保持你原来的加窗逻辑
+
+    # A. 参考信道 RXB 频谱
+    fft_ref = np.fft.fftshift(np.fft.fft(ref * window))
+    mag_db_ref = 20 * np.log10(np.abs(fft_ref) + 1e-12)
+
+    # B. 调制信道 RXA 频谱
+    fft_raw = np.fft.fftshift(np.fft.fft(tma * window))
+    mag_db_raw = 20 * np.log10(np.abs(fft_raw) + 1e-12)
+
+    # C. 去斜后 De-chirped 频谱
+    fft_res = np.fft.fftshift(np.fft.fft(y_pc * window))
+    mag_db_res = 20 * np.log10(np.abs(fft_res) + 1e-12)
+
+    freqs = np.fft.fftshift(np.fft.fftfreq(N, d=1 / fs))
+
+
+    # ================= 5. 核心算法：最小二乘 (LS) 矩阵解耦 =================
+    # 替换了原有的比幅逻辑，改用提取复数值并进行矩阵运算
+
+    def get_complex_peak(target_f):
+        """寻找目标频点附近的峰值，并返回真实的复数值(包含幅度和绝对相位)"""
+        idx = np.argmin(np.abs(freqs - target_f))
+        start = max(0, idx - 5)
+        end = min(N, idx + 6)
+        local_max_idx = np.argmax(np.abs(fft_res[start:end]))
+        return fft_res[start:end][local_max_idx]
+
+
+    # 1. 提取 k = -1, 0, 1 阶谐波的复包络，构造观测向量 h
+    h_minus1 = get_complex_peak(-SWITCHING_FREQ)
+    h_0 = get_complex_peak(0)
+    h_plus1 = get_complex_peak(SWITCHING_FREQ)
+    h_vec = np.array([[h_minus1], [h_0], [h_plus1]])
+
+    # 2. 构造理论系统特征矩阵 C (对应论文 3.1 节)
+    # 基于 50% 占空比方波调制，0 和 pi 交替切换
+    C_matrix = np.array([
+        [1j / np.pi, -1j / np.pi],  # k = -1 阶
+        [0.5, 0.5],  # k =  0 阶
+        [-1j / np.pi, 1j / np.pi]  # k =  1 阶
+    ])
+
+    # 3. 最小二乘伪逆求解导向矢量
+    a_est = np.linalg.pinv(C_matrix) @ h_vec
+
+    # 4. 提取相邻阵元相对相位并解算角度
+    phase_diff = np.angle(a_est[1, 0] / a_est[0, 0])
+    sin_theta = (-phase_diff * lambda_val) / (2 * np.pi * ANTENNA_DISTANCE)
+
+    # 边界约束
+    sin_theta = np.clip(sin_theta, -1.0, 1.0)
+    angle_deg = np.degrees(np.arcsin(sin_theta))
+
+    # 打印报告
+    print(f"\n📏 Estimated Angle (LS Method): {angle_deg:.2f}°")
+
+    # --- 6. Matplotlib 学术级 3子图绘制 ---
+    print("▶️  Plotting 3-panel spectrum comparison...")
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+
+    plt.rcParams['font.sans-serif'] = ['Arial']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    # 图 1 & 图 2 保持原样
+    axes[0].plot(freqs / 1e3, mag_db_ref, color='#1f77b4', linewidth=1)
+    axes[0].set_title('1. Spectrum of Reference Channel (RXB)', fontsize=12, fontweight='bold')
+    axes[0].set_ylabel('Magnitude (dB)', fontsize=11)
+    axes[0].grid(True, linestyle='--', alpha=0.6)
+
+    axes[1].plot(freqs / 1e3, mag_db_raw, color='#ff7f0e', linewidth=1)
+    axes[1].set_title('2. Spectrum of Modulated Channel (RXA) - Expecting Wideband Block', fontsize=12,
+                      fontweight='bold')
+    axes[1].set_ylabel('Magnitude (dB)', fontsize=11)
+    axes[1].grid(True, linestyle='--', alpha=0.6)
+
+    # 图 3: 去斜频谱 & LS 三峰标记
+    axes[2].plot(freqs / 1e3, mag_db_res, color='#2ca02c', linewidth=1)
+    axes[2].set_title(f'3. De-chirped Spectrum & LS Angle Estimation ({angle_deg:.2f}°)', fontsize=12,
+                      fontweight='bold')
+    axes[2].set_ylabel('Magnitude (dB)', fontsize=11)
+    axes[2].set_xlabel('Frequency Offset (kHz)', fontsize=12)
+    axes[2].grid(True, linestyle='--', alpha=0.6)
+
+    # 计算提取出来的三个复数值的 dB 高度
+    mag_h_minus1 = 20 * np.log10(np.abs(h_minus1) + 1e-12)
+    mag_h_0 = 20 * np.log10(np.abs(h_0) + 1e-12)
+    mag_h_plus1 = 20 * np.log10(np.abs(h_plus1) + 1e-12)
+
+    # 在图 3 上标记 k=-1, 0, 1 的散点
+    axes[2].plot([-SWITCHING_FREQ / 1e3, 0, SWITCHING_FREQ / 1e3],
+                 [mag_h_minus1, mag_h_0, mag_h_plus1],
+                 'ro', markersize=6, label='Extracted Peaks')
+
+    # 文字标注
+    axes[2].annotate('k=-1', xy=(-SWITCHING_FREQ / 1e3, mag_h_minus1),
+                     xytext=(0, 15), textcoords='offset points', color='red', fontweight='bold', ha='center')
+    axes[2].annotate('k=0', xy=(0, mag_h_0),
+                     xytext=(0, 15), textcoords='offset points', color='red', fontweight='bold', ha='center')
+    axes[2].annotate('k=1', xy=(SWITCHING_FREQ / 1e3, mag_h_plus1),
+                     xytext=(0, 15), textcoords='offset points', color='red', fontweight='bold', ha='center')
+
+    axes[2].set_xlim([-40, 40])
+
+    # 动态调整 Y 轴上限防遮挡
+    current_bottom, current_top = axes[2].get_ylim()
+    max_peak = max(mag_h_minus1, mag_h_0, mag_h_plus1)
+    axes[2].set_ylim(current_bottom, max(current_top, max_peak + 20))
+
+    plt.tight_layout()
+    plt.show()
+
+    # fig.savefig('TMA_3Panel_Spectrum_LS.png', dpi=300, bbox_inches='tight')
